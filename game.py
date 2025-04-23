@@ -3,6 +3,7 @@ import random
 from enum import Enum
 from collections import namedtuple
 import numpy as np
+import math
 
 pygame.init()
 font = pygame.font.Font('arial.ttf', 25)
@@ -22,14 +23,19 @@ RED = (200,0,0)
 BLUE1 = (0, 0, 255)
 BLUE2 = (0, 100, 255)
 BLACK = (0,0,0)
+GREEN = (0, 255, 0)
+YELLOW = (255, 255, 0)
 
 BLOCK_SIZE = 20
-SPEED = 100
+SPEED = 120  # Increased speed for faster training
 
 # Add these colors after the existing color definitions
 GRID_COLOR = (16, 52, 10)  # Darker gray for grid
 SCORE_BG = (1, 64, 5)    # Background for score
 SCORE_TEXT = (255, 255, 255)  # White text
+
+# Max steps without eating before timeout
+MAX_STEPS_WITHOUT_FOOD = 300
 
 class SnakeGameAI:
 
@@ -202,6 +208,10 @@ class SnakeGameAI:
         self.food = None
         self._place_food()
         self.frame_iteration = 0
+        self.food_iterations = 0  # Counter for steps without eating
+        self.last_food_distance = 0  # To track if getting closer to food
+        self.previous_positions = []  # Track recent positions for loop detection
+        self.last_distances = []  # Track distance history for smarter rewards
 
 
     def _place_food(self):
@@ -210,10 +220,26 @@ class SnakeGameAI:
         self.food = Point(x, y)
         if self.food in self.snake:
             self._place_food()
+        
+        # Calculate initial distance to food for progress tracking
+        self.last_food_distance = self._get_food_distance()
+        self.food_iterations = 0  # Reset counter when placing new food
+
+
+    def _get_food_distance(self):
+        """Calculate the Manhattan distance to food"""
+        return abs(self.head.x - self.food.x) + abs(self.head.y - self.food.y)
+    
+
+    def _get_euclidean_distance(self, point1, point2):
+        """Calculate the Euclidean distance between two points"""
+        return math.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2)
 
 
     def play_step(self, action):
         self.frame_iteration += 1
+        self.food_iterations += 1
+        
         # 1. collect user input
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -224,34 +250,109 @@ class SnakeGameAI:
         self._move(action) # update the head
         self.snake.insert(0, self.head)
         
+        # Track recent positions to detect loops (store only every few steps to save memory)
+        if self.frame_iteration % 5 == 0:
+            pos_hash = (self.head.x, self.head.y, self.direction.value)
+            self.previous_positions.append(pos_hash)
+            if len(self.previous_positions) > 20:  # Keep only recent positions
+                self.previous_positions.pop(0)
+        
         # 3. check if game over
         reward = 0
         game_over = False
-        if self.is_collision() or self.frame_iteration > 100*len(self.snake):
+        
+        # Game over conditions
+        if self.is_collision():
             game_over = True
-            reward = -10
+            reward = -15  # Significant negative reward for collision
             return reward, game_over, self.score
-
+        
+        # Timeout condition - avoid endless games
+        if self.food_iterations > MAX_STEPS_WITHOUT_FOOD:
+            game_over = True
+            reward = -10  # Penalize for not finding food in reasonable time
+            return reward, game_over, self.score
+            
+        # Detect if snake is going in circles without progress
+        if len(self.previous_positions) >= 20:
+            unique_positions = len(set(self.previous_positions))
+            if unique_positions <= 4:  # Snake is stuck in a small loop
+                reward -= 1  # Small penalty for repetitive movement
+        
         # 4. place new food or just move
         if self.head == self.food:
             self.score += 1
-            reward = 10 + len(self.snake)  # Bigger reward for longer snake
+            
+            # Progressive reward system - bigger reward for longer snake
+            base_reward = 20  # Base reward for eating
+            
+            # Add bonus for faster food consumption
+            time_bonus = max(0, 100 - self.food_iterations) / 10
+            
+            # Length bonus - more reward as snake gets longer
+            length_bonus = min(self.score, 10)  # Cap at 10
+            
+            # Calculate total reward
+            reward = base_reward + time_bonus + length_bonus
+            
+            # Place new food and reset counters
             self._place_food()
+            self.previous_positions = []  # Reset position history after eating
+            
         else:
-            # Add distance-based reward
-            old_distance = abs(self.snake[1].x - self.food.x) + abs(self.snake[1].y - self.food.y)
-            new_distance = abs(self.head.x - self.food.x) + abs(self.head.y - self.food.y)
-            if new_distance < old_distance:
-                reward = 1  # Small positive reward for moving towards food
-            else:
-                reward = -1  # Small negative reward for moving away from food
+            # Remove the tail
             self.snake.pop()
+            
+            # Calculate current distance to food
+            current_distance = self._get_food_distance()
+            
+            # Track recent distances
+            self.last_distances.append(current_distance)
+            if len(self.last_distances) > 10:
+                self.last_distances.pop(0)
+            
+            # Reward for moving toward food (using trend, not just single step)
+            if len(self.last_distances) >= 3:
+                avg_prev = sum(self.last_distances[:-3]) / max(1, len(self.last_distances[:-3]))
+                avg_recent = sum(self.last_distances[-3:]) / 3
+                
+                if avg_recent < avg_prev:  # Trending closer to food
+                    reward += 0.5
+                elif avg_recent > avg_prev:  # Trending away from food
+                    reward -= 0.2
+            
+            # Check for near-collision conditions - encourage path planning
+            head_dangers = self._check_surrounding_dangers()
+            if head_dangers >= 3:  # Snake has limited movement options
+                reward -= 0.2  # Small penalty to encourage better planning
+            
+            # Progressive penalty for taking too long to find food
+            if self.food_iterations > 50 and self.food_iterations % 10 == 0:
+                reward -= 0.1 * (self.food_iterations // 50)  # Increasing penalty
         
         # 5. update ui and clock
         self._update_ui()
         self.clock.tick(SPEED)
+        
         # 6. return game over and score
         return reward, game_over, self.score
+
+
+    def _check_surrounding_dangers(self):
+        """Count how many adjacent cells contain danger (wall or body)"""
+        directions = [
+            Point(self.head.x + BLOCK_SIZE, self.head.y),  # right
+            Point(self.head.x - BLOCK_SIZE, self.head.y),  # left
+            Point(self.head.x, self.head.y + BLOCK_SIZE),  # down
+            Point(self.head.x, self.head.y - BLOCK_SIZE)   # up
+        ]
+        
+        danger_count = 0
+        for point in directions:
+            if self.is_collision(point):
+                danger_count += 1
+                
+        return danger_count
 
 
     def is_collision(self, pt=None):
@@ -264,6 +365,21 @@ class SnakeGameAI:
         if pt in self.snake[1:]:
             return True
 
+        return False
+        
+    # New function to check proximity to danger
+    def is_near_collision(self, pt, distance=1):
+        # Check if point is near a wall
+        if (pt.x < distance*BLOCK_SIZE or pt.x > self.w - distance*BLOCK_SIZE or 
+            pt.y < distance*BLOCK_SIZE or pt.y > self.h - distance*BLOCK_SIZE):
+            return True
+            
+        # Check if point is near snake body
+        for segment in self.snake[1:]:
+            if (abs(pt.x - segment.x) < distance*BLOCK_SIZE and 
+                abs(pt.y - segment.y) < distance*BLOCK_SIZE):
+                return True
+                
         return False
 
 
